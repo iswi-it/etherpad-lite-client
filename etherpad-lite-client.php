@@ -3,20 +3,31 @@ class EtherpadLiteClient {
 
     const API_VERSION             = "1.3.0";
 
+
     const CODE_OK                 = 0;
     const CODE_INVALID_PARAMETERS = 1;
     const CODE_INTERNAL_ERROR     = 2;
     const CODE_INVALID_FUNCTION   = 3;
     const CODE_INVALID_API_KEY    = 4;
 
-    protected $apiKey = "";
-    protected $baseUrl = "http://localhost:9001/api";
-  
-    public function __construct($apiKey, $baseUrl = null) {
-        if (strlen($apiKey) < 1) {
-          throw new InvalidArgumentException("[{$apiKey}] is not a valid API key");
+    protected $baseUrl = "http://localhost:9001";
+
+    protected $oauthToken = null;
+    protected $oauthTokenExpiresAt = 0;
+
+    protected $clientId = "";
+    protected $clientSecret = "";
+
+    public function __construct($clientId, $clientSecret, $baseUrl = null) {
+        if (strlen($clientId) < 1) {
+          throw new InvalidArgumentException("[{$clientId}] is not a valid client id");
         }
-        $this->apiKey  = $apiKey;
+        if (strlen($clientSecret) < 1) {
+          throw new InvalidArgumentException("[{$clientSecret}] is not a valid client secret");
+        }
+        $this->clientId  = $clientId;
+        $this->clientSecret = $clientSecret;
+        
         if (isset($baseUrl)) {
             $this->baseUrl = $baseUrl;
         }
@@ -38,19 +49,60 @@ class EtherpadLiteClient {
           return $candidate? "true" : "false";
         }
         return $candidate;
-      }
+    }
+
+    protected function getAccessToken(): string
+    {
+        // Token still valid → reuse it
+        if ($this->oauthToken && time() < $this->oauthTokenExpiresAt) {
+            return $this->oauthToken;
+        }
+
+        $tokenUrl = $this->baseUrl."/oidc/token";
+
+        $c = curl_init($tokenUrl);
+        curl_setopt($c, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($c, CURLOPT_POST, true);
+        curl_setopt($c, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/x-www-form-urlencoded'
+        ]);
+        curl_setopt($c, CURLOPT_USERPWD, $this->clientId . ':' . $this->clientSecret);
+        $query = http_build_query([
+            'grant_type' => 'client_credentials',
+            'resource' => $this->baseUrl."/api"
+        ], '', '&');
+        curl_setopt($c, CURLOPT_POSTFIELDS, $query);
+
+        $response = curl_exec($c);
+        curl_close($c);
+
+        $data = json_decode($response, true);
+        if (!isset($data['access_token'])) {
+            throw new RuntimeException('Failed to obtain OAuth token '.$response.' '.$query);
+        }
+
+        $this->oauthToken = $data['access_token'];
+        $this->oauthTokenExpiresAt = time() + ($data['expires_in'] ?? 3600) - 60;
+
+        return $this->oauthToken;
+    }
+
 
     protected function call($function, array $arguments = [], $method = 'GET') {
-        $arguments['apikey'] = $this->apiKey;
+
+        $token = $this->getAccessToken();
         $arguments = array_map(array($this, 'convertBools'), $arguments);
-        $url = $this->baseUrl."/".self::API_VERSION."/".$function;
+        $url = $this->baseUrl."/api/".self::API_VERSION."/".$function;
 
         $c = curl_init($url);
         curl_setopt($c, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($c, CURLOPT_TIMEOUT, 20);
         curl_setopt($c, CURLOPT_POST, true);
-        curl_setopt($c, CURLOPT_HTTPHEADER, ['Content-Type:application/json']);
-        curl_setopt($c, CURLOPT_POSTFIELDS, json_encode($arguments));
+        curl_setopt($c, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/x-www-form-urlencoded',
+            'Authorization: Bearer ' . $token
+        ]);
+        curl_setopt($c, CURLOPT_POSTFIELDS, http_build_query($arguments, '', '&'));
         $result = curl_exec($c);
         //file_put_contents('logs.txt', $result.PHP_EOL , FILE_APPEND | LOCK_EX);
         $result = json_decode($result);
@@ -58,7 +110,7 @@ class EtherpadLiteClient {
         curl_close($c);
         
         if(!$result) {
-            throw new UnexpectedValueException("Empty or No Response from the server");
+            throw new UnexpectedValueException("Empty or No Response from the server".json_encode($arguments).' '.$token.' '.$url);
         }
         
         // $result = json_decode($result);
